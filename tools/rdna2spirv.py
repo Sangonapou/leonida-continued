@@ -7845,7 +7845,12 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
             r = self.trig_exact_zero(op, f, r)
-            r = self.clamp_f16(r, mods)
+            # +-inf reaches Sin/Cos as a NaN of unspecified sign; the hardware gives 0xfe00 (a negative quiet NaN) for
+            # both infinities (docs/design.md, f16 transcendentals).
+            inf, out = self.tmp(), self.tmp()
+            self.emit(f"{inf} = OpIsInf %bool {f}")
+            self.emit(f"{out} = OpSelect %float {inf} {self.tof(self.cu(0xFFC00000))} {r}")
+            r = self.clamp_f16(out, mods)
             self.f16_out(a[0], r, dhi, mode=False)    # sin ignores MODE rounding on hardware (RX 6800, SHADER-35); cos is unmeasured, assumed like it
         elif op in ("v_pk_add_u16", "v_pk_add_i16", "v_pk_sub_u16", "v_pk_sub_i16", "v_pk_mul_lo_u16",
                     "v_pk_mad_u16", "v_pk_mad_i16", "v_pk_max_u16", "v_pk_max_i16", "v_pk_min_u16", "v_pk_min_i16"):
@@ -9837,18 +9842,19 @@ class Gen:
                     clamp_input = self.tmp()
                     self.emit(f"{clamp_input} = OpSelect %float {inf} %f0 {f}")
                     f = clamp_input
-            # SPIR-V leaves 1/0, InverseSqrt(x <= 0) and Sqrt(x < 0) undefined, so those operands are replaced by 1.0
-            # and the hardware's result is selected afterwards (docs/design.md, f16 transcendentals): rcp(+-0) = +-inf,
-            # rsq(+-0) = +-inf, rsq and sqrt of a negative operand (-inf included) = 0xfe00 (a negative quiet NaN).
+            # SPIR-V leaves 1/0, InverseSqrt(x <= 0), Sqrt(x < 0) and Log2(x <= 0) undefined, so those operands are
+            # replaced by 1.0 and the hardware's result is selected afterwards (docs/design.md, f16 transcendentals):
+            # rcp(+-0) = +-inf, rsq(+-0) = +-inf, log(+-0) = -inf, rsq, sqrt and log of a negative operand (-inf
+            # included) = 0xfe00 (a negative quiet NaN).
             x, edge = f, None
-            if op in ("v_rcp_f16", "v_rsq_f16", "v_sqrt_f16"):
+            if op in ("v_rcp_f16", "v_rsq_f16", "v_sqrt_f16", "v_log_f16"):
                 sg, zero, below, bad = self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{sg} = OpBitwiseAnd %uint {self.tou(f)} {self.cu(0x80000000)}")
                 self.emit(f"{zero} = OpFOrdEqual %bool {f} %f0")
                 self.emit(f"{below} = OpFOrdLessThan %bool {f} %f0")
                 if op == "v_rcp_f16":
                     self.emit(f"{bad} = OpCopyObject %bool {zero}")
-                elif op == "v_rsq_f16":
+                elif op in ("v_rsq_f16", "v_log_f16"):
                     self.emit(f"{bad} = OpFOrdLessThanEqual %bool {f} %f0")
                 else:
                     self.emit(f"{bad} = OpCopyObject %bool {below}")
@@ -9862,7 +9868,10 @@ class Gen:
             if edge:
                 sg, zero, below = edge
                 ib, inf, nan, t = self.tmp(), self.tmp(), self.tof(self.cu(0xFFC00000)), self.tmp()
-                self.emit(f"{ib} = OpBitwiseOr %uint {sg} {self.cu(0x7F800000)}")
+                if op == "v_log_f16":
+                    self.emit(f"{ib} = OpCopyObject %uint {self.cu(0xFF800000)}")    # log(+-0) = -inf, either sign
+                else:
+                    self.emit(f"{ib} = OpBitwiseOr %uint {sg} {self.cu(0x7F800000)}")
                 self.emit(f"{inf} = OpBitcast %float {ib}")
                 if op != "v_sqrt_f16":
                     self.emit(f"{t} = OpSelect %float {zero} {inf} {r}")
